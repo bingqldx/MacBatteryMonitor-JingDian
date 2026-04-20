@@ -7,6 +7,7 @@
 
 // Status Bar & Menu Placeholders
 "status.battery_info.placeholder" = "电量: -- / -- mAh (--%) ";
+"status.battery.title" = "电池";
 "status.power_info.placeholder" = "功率: -- W · -- mA";
 "status.time.remaining.placeholder" = "剩余时间: --";
 "status.temp_voltage.placeholder" = "温度: --°C · 电压: -- V";
