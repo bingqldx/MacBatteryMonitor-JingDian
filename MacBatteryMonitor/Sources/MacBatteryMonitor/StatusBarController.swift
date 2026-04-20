@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.ps
 import UniformTypeIdentifiers
 
 /// 应用 CPU 曲线弹出窗口
@@ -1163,10 +1164,24 @@ class StatusBarController: NSObject, NSMenuDelegate {
         case lastDischarge
     }
     
+    private enum BatteryIconState {
+        case normal
+        case charging
+        case pluggedIn
+        case low
+    }
+    
+    private struct StatusBarSymbolMetrics {
+        static let batteryPointSize: CGFloat = 17
+        static let plugPointSize: CGFloat = 15
+        static let weight: NSFont.Weight = .regular
+    }
+    
     private var statusItem: NSStatusItem!
     private var menu: NSMenu!
     private var backgroundTimer: Timer?
     private var liveTimer: DispatchSourceTimer?
+    private var powerSourceRunLoopSource: CFRunLoopSource?
     private var tracker: ConsumptionTracker?
     private var isMenuOpen = false
     private var lastRefreshTime: Date = Date()  // 追踪刷新时间
@@ -1195,18 +1210,19 @@ class StatusBarController: NSObject, NSMenuDelegate {
         setupStatusBar()
         setupMenu()
         setupSettingsMenu()
+        startPowerSourceMonitoring()
         startBackgroundTimer()
-        EnergyHistoryManager.shared.updateInBackground { [weak self] in
-            self?.updateStatusBar()
-        }
+        updateStatusBar()
+        EnergyHistoryManager.shared.updateInBackground()
     }
     
     private func setupStatusBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         
-        // 使用原生风格的电池图标
+        // 使用官方 SF Symbols 作为菜单栏电池图标
         if let button = statusItem.button {
-            button.image = createBatteryImage(percentage: 100, charging: false)
+            button.image = createBatteryImage(percentage: 100, isCharging: false, isPluggedIn: false)
+            button.imageScaling = .scaleNone
             // 设置鼠标事件处理
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.action = #selector(handleClick(_:))
@@ -1214,57 +1230,97 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
     
-    /// 创建原生风格电池图标（缩小版）
-    private func createBatteryImage(percentage: Int, charging: Bool) -> NSImage {
-        let size = NSSize(width: 18, height: 9)
-        let image = NSImage(size: size, flipped: false) { rect in
-            let path = NSBezierPath()
-            
-            // 电池外框
-            let bodyRect = NSRect(x: 0, y: 0.5, width: 15, height: 8)
-            path.appendRoundedRect(bodyRect, xRadius: 1.5, yRadius: 1.5)
-            
-            // 电池头
-            let capRect = NSRect(x: 15, y: 2.5, width: 2, height: 4)
-            path.appendRoundedRect(capRect, xRadius: 0.5, yRadius: 0.5)
-            
-            NSColor.labelColor.withAlphaComponent(0.8).setStroke()
-            path.lineWidth = 1
-            path.stroke()
-            
-            // 填充电量
-            let fillWidth = max(0, CGFloat(percentage) / 100 * 11)
-            let fillRect = NSRect(x: 2, y: 2.5, width: fillWidth, height: 4)
-            
-            if charging {
-                NSColor.systemGreen.setFill()
-            } else if percentage <= 20 {
-                NSColor.systemRed.setFill()
-            } else {
-                NSColor.labelColor.withAlphaComponent(0.6).setFill()
-            }
-            
-            NSBezierPath(roundedRect: fillRect, xRadius: 0.5, yRadius: 0.5).fill()
-            
-            // 充电闪电符号
-            if charging {
-                let bolt = NSBezierPath()
-                bolt.move(to: NSPoint(x: 8.5, y: 1))
-                bolt.line(to: NSPoint(x: 6, y: 4.5))
-                bolt.line(to: NSPoint(x: 7.5, y: 4.5))
-                bolt.line(to: NSPoint(x: 6.5, y: 8))
-                bolt.line(to: NSPoint(x: 9, y: 4))
-                bolt.line(to: NSPoint(x: 7.5, y: 4))
-                bolt.close()
-                NSColor.white.setFill()
-                bolt.fill()
-            }
-            
-            return true
+    /// 创建基于官方 SF Symbols 的菜单栏电池图标
+    private func createBatteryImage(percentage: Int, isCharging: Bool, isPluggedIn: Bool) -> NSImage {
+        let clampedPercentage = min(max(percentage, 0), 100)
+        let state = batteryIconState(
+            percentage: clampedPercentage,
+            isCharging: isCharging,
+            isPluggedIn: isPluggedIn
+        )
+        let symbolName = statusSymbolName(for: state, percentage: clampedPercentage)
+        let pointSize = symbolPointSize(for: state)
+        
+        if state == .low,
+           let image = tintedStatusSymbol(named: symbolName, pointSize: pointSize, color: .systemRed) {
+            return image
         }
         
-        image.isTemplate = false
+        let image = configuredStatusSymbol(named: symbolName, pointSize: pointSize) ?? NSImage()
+        image.isTemplate = true
         return image
+    }
+    
+    private func batteryIconState(percentage: Int, isCharging: Bool, isPluggedIn: Bool) -> BatteryIconState {
+        if isCharging {
+            return .charging
+        }
+        if isPluggedIn {
+            return .pluggedIn
+        }
+        if percentage <= 20 {
+            return .low
+        }
+        return .normal
+    }
+    
+    private func statusSymbolName(for state: BatteryIconState, percentage: Int) -> String {
+        switch state {
+        case .charging:
+            return "battery.100percent.bolt"
+        case .pluggedIn:
+            return "powerplug"
+        case .normal, .low:
+            return batterySymbolName(for: percentage)
+        }
+    }
+    
+    private func batterySymbolName(for percentage: Int) -> String {
+        switch percentage {
+        case 0...12:
+            return "battery.0percent"
+        case 13...37:
+            return "battery.25percent"
+        case 38...62:
+            return "battery.50percent"
+        case 63...87:
+            return "battery.75percent"
+        default:
+            return "battery.100percent"
+        }
+    }
+    
+    private func symbolPointSize(for state: BatteryIconState) -> CGFloat {
+        switch state {
+        case .pluggedIn:
+            return StatusBarSymbolMetrics.plugPointSize
+        case .charging, .normal, .low:
+            return StatusBarSymbolMetrics.batteryPointSize
+        }
+    }
+    
+    private func configuredStatusSymbol(named systemName: String, pointSize: CGFloat) -> NSImage? {
+        guard let symbol = NSImage(systemSymbolName: systemName, accessibilityDescription: nil) else {
+            return nil
+        }
+        
+        let configuration = NSImage.SymbolConfiguration(pointSize: pointSize, weight: StatusBarSymbolMetrics.weight)
+        return symbol.withSymbolConfiguration(configuration)
+    }
+    
+    private func tintedStatusSymbol(named systemName: String, pointSize: CGFloat, color: NSColor) -> NSImage? {
+        guard let symbol = configuredStatusSymbol(named: systemName, pointSize: pointSize) else { return nil }
+        
+        let tintedSymbol = NSImage(size: symbol.size)
+        tintedSymbol.lockFocus()
+        let symbolBounds = NSRect(origin: .zero, size: symbol.size)
+        symbol.draw(in: symbolBounds)
+        NSGraphicsContext.current?.compositingOperation = .sourceIn
+        color.setFill()
+        NSBezierPath(rect: symbolBounds).fill()
+        tintedSymbol.unlockFocus()
+        tintedSymbol.isTemplate = false
+        return tintedSymbol
     }
     
     private func setupMenu() {
@@ -1642,6 +1698,21 @@ class StatusBarController: NSObject, NSMenuDelegate {
     
     // MARK: - Timers
     
+    private func startPowerSourceMonitoring() {
+        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        powerSourceRunLoopSource = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            let controller = Unmanaged<StatusBarController>.fromOpaque(context).takeUnretainedValue()
+            DispatchQueue.main.async {
+                controller.updateStatusBar()
+            }
+        }, context)?.takeRetainedValue()
+        
+        if let powerSourceRunLoopSource {
+            CFRunLoopAddSource(CFRunLoopGetMain(), powerSourceRunLoopSource, CFRunLoopMode.commonModes)
+        }
+    }
+    
     private func startBackgroundTimer() {
         backgroundTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             EnergyHistoryManager.shared.updateInBackground {
@@ -1688,7 +1759,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
         
         if let button = statusItem.button {
-            button.image = createBatteryImage(percentage: info.percentage, charging: info.isCharging)
+            button.image = createBatteryImage(
+                percentage: info.percentage,
+                isCharging: info.isCharging,
+                isPluggedIn: info.isPluggedIn
+            )
         }
     }
     
@@ -1779,7 +1854,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
         liveViews[6].text = String(format: LocalizedString("status.health", comment: ""), info.healthPercentage, info.cycleCount, info.designCapacity)
         
         if let button = statusItem.button {
-            button.image = createBatteryImage(percentage: info.percentage, charging: info.isCharging)
+            button.image = createBatteryImage(
+                percentage: info.percentage,
+                isCharging: info.isCharging,
+                isPluggedIn: info.isPluggedIn
+            )
         }
     }
     
@@ -2161,11 +2240,17 @@ class StatusBarController: NSObject, NSMenuDelegate {
         EnergyHistoryManager.shared.saveHistory(sync: true)
         backgroundTimer?.invalidate()
         liveTimer?.cancel()
+        if let powerSourceRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSourceRunLoopSource, CFRunLoopMode.commonModes)
+        }
         NSApplication.shared.terminate(nil)
     }
     
     deinit {
         backgroundTimer?.invalidate()
         liveTimer?.cancel()
+        if let powerSourceRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSourceRunLoopSource, CFRunLoopMode.commonModes)
+        }
     }
 }
